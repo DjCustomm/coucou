@@ -68,12 +68,14 @@ final class HookServer: @unchecked Sendable {
     @MainActor
     private func handledNote(pill: String) -> String {
         switch pill {
-        case "agent_cursor":  return "Handled in Cursor."
-        case "agent_codex":   return "Handled in Codex."
-        case "agent_copilot": return "Handled in Copilot CLI."
-        case "agent_muse":    return "Handled in Muse Code."
-        case "agent_hermes":  return "Handled in Hermes."
-        default:              return "Handled in \(claudeHostName)."
+        case "agent_cursor":      return "Handled in Cursor."
+        case "agent_codex":       return "Handled in Codex."
+        case "agent_copilot":     return "Handled in Copilot CLI."
+        case "agent_muse":        return "Handled in Muse Code."
+        case "agent_antigravity": return "Handled in Antigravity."
+        case "agent_opencode":    return "Handled in OpenCode."
+        case "agent_hermes":      return "Handled in Hermes."
+        default:                  return "Handled in \(claudeHostName)."
         }
     }
 
@@ -81,12 +83,14 @@ final class HookServer: @unchecked Sendable {
     @MainActor
     private func waitingNote(pill: String) -> String {
         switch pill {
-        case "agent_cursor":  return "Still waiting in Cursor."
-        case "agent_codex":   return "Still waiting in Codex."
-        case "agent_copilot": return "Still waiting in Copilot CLI."
-        case "agent_muse":    return "Still waiting in Muse Code."
-        case "agent_hermes":  return "Still waiting in Hermes."
-        default:              return "Still waiting in \(claudeHostName)."
+        case "agent_cursor":      return "Still waiting in Cursor."
+        case "agent_codex":       return "Still waiting in Codex."
+        case "agent_copilot":     return "Still waiting in Copilot CLI."
+        case "agent_muse":        return "Still waiting in Muse Code."
+        case "agent_antigravity": return "Still waiting in Antigravity."
+        case "agent_opencode":    return "Still waiting in OpenCode."
+        case "agent_hermes":      return "Still waiting in Hermes."
+        default:                  return "Still waiting in \(claudeHostName)."
         }
     }
 
@@ -563,13 +567,26 @@ final class HookServer: @unchecked Sendable {
             appendStep(id: agentId, step: step)
             if isQuestion {
                 SoundEngine.shared.play("question")
-                if state.isPresent { expandIfNeeded(to: .overview) }
+                if state.pendingApproval == nil && state.pendingQuestion == nil {
+                    if focusBeforeApproval == nil { focusBeforeApproval = state.focusId }
+                    state.setFocus(agentId)
+                    state.isPinned = true
+                    expandIfNeeded(to: .question)
+                } else if state.isPresent {
+                    expandIfNeeded(to: .overview)
+                }
             }
             nbLog("PreToolUse \(tool)")
 
         case "PostToolUse":
             sessions.note(pill: agentId, display: display, working: true)
+            let wasQuestion = state.pendingApproval == nil && state.pendingQuestion == nil && state.tasks.first(where: { $0.id == agentId })?.state == .question
             state.updateTask(id: agentId, state: .working)
+            if wasQuestion {
+                state.isPinned = false
+                restoreFocusAfterApproval(pillId: agentId)
+                if state.currentView == .question { state.currentView = .overview }
+            }
             // Live diff for Edit / MultiEdit / Write
             let diffTool = payload["tool_name"] as? String ?? ""
             let diffInput = payload["tool_input"] as? [String: Any] ?? [:]
@@ -582,7 +599,13 @@ final class HookServer: @unchecked Sendable {
 
         case "PostToolUseFailure":
             sessions.note(pill: agentId, display: display, working: true)
+            let wasQuestion = state.pendingApproval == nil && state.pendingQuestion == nil && state.tasks.first(where: { $0.id == agentId })?.state == .question
             state.updateTask(id: agentId, state: .working)
+            if wasQuestion {
+                state.isPinned = false
+                restoreFocusAfterApproval(pillId: agentId)
+                if state.currentView == .question { state.currentView = .overview }
+            }
             appendStep(id: agentId, step: "⚠ failed")
 
         case "Notification":
@@ -816,26 +839,35 @@ final class HookServer: @unchecked Sendable {
             termProgram.lowercased().contains("vscode") ||
             bundleId.lowercased().contains("vscode"))
 
-        // Codex, Copilot CLI and Muse Code get the same approval card as Claude Code / Cursor.
+        // Codex, Copilot CLI, Muse Code, Antigravity, Cursor Agent and OpenCode get the same
+        // approval card as Claude Code / Cursor.
         // Other external agents (any other coucou_agent) answer immediately with "ask"
         // so the agent re-asks in its own terminal — they do not get a notch card.
         #if !APPSTORE
-        let isCodexRequest   = rawAgent == "codex"
-        let isCopilotRequest = rawAgent == "copilot"
-        let isMuseRequest    = rawAgent == "muse"
+        let isCodexRequest       = rawAgent == "codex"
+        let isCopilotRequest     = rawAgent == "copilot"
+        let isMuseRequest        = rawAgent == "muse"
+        let isAntigravityRequest = rawAgent == "antigravity"
+        let isCursorAgentRequest = rawAgent == "cursor"
+        let isOpenCodeRequest    = rawAgent == "opencode"
         // isHermesRequest is true only when the plugin sent coucou_has_transport: true,
         // meaning register_approval_transport is wired and Hermes will honour our choice.
         // Without that flag the request falls through to "ask" so Hermes handles it natively.
-        let isHermesRequest  = rawAgent == "hermes"
+        let isHermesRequest      = rawAgent == "hermes"
             && UserDefaults.standard.bool(forKey: "hermesApprovalsEnabled")
             && (payload["coucou_has_transport"] as? Bool == true)
         #else
-        let isCodexRequest   = false
-        let isCopilotRequest = false
-        let isMuseRequest    = false
-        let isHermesRequest  = false
+        let isCodexRequest       = false
+        let isCopilotRequest     = false
+        let isMuseRequest        = false
+        let isAntigravityRequest = false
+        let isCursorAgentRequest = false
+        let isOpenCodeRequest    = false
+        let isHermesRequest      = false
         #endif
-        if !isCodexRequest && !isCopilotRequest && !isMuseRequest && !isHermesRequest && Self.validateAgent(rawAgent) != nil {
+        let isApprovedExternal = isCodexRequest || isCopilotRequest || isMuseRequest
+            || isAntigravityRequest || isCursorAgentRequest || isOpenCodeRequest || isHermesRequest
+        if !isApprovedExternal && Self.validateAgent(rawAgent) != nil {
             Task.detached { [weak self] in
                 self?.sendLine(fd: fd, text: #"{"permissionDecision":"ask"}"#)
                 close(fd)
@@ -851,6 +883,12 @@ final class HookServer: @unchecked Sendable {
             pillId = "agent_copilot"
         } else if isMuseRequest {
             pillId = "agent_muse"
+        } else if isAntigravityRequest {
+            pillId = "agent_antigravity"
+        } else if isCursorAgentRequest {
+            pillId = "agent_cursor"
+        } else if isOpenCodeRequest {
+            pillId = "agent_opencode"
         } else if isHermesRequest {
             pillId = "agent_hermes"
         } else if isCursorEditor {
@@ -862,7 +900,7 @@ final class HookServer: @unchecked Sendable {
         let terminalHost = isCursorEditor || isVSCodeEditor ? nil
             : ClaudeHost.terminal(termProgram: termProgram, bundleId: bundleId)
         let isTerminal = terminalHost != nil && ClaudeHost.terminalCardsEnabled
-        guard isCodexRequest || isCopilotRequest || isMuseRequest || isHermesRequest || isCursorEditor || isVSCodeEditor || isTerminal else {
+        guard isApprovedExternal || isCursorEditor || isVSCodeEditor || isTerminal else {
             Task.detached { [weak self] in
                 self?.sendLine(fd: fd, text: #"{"permissionDecision":"ask"}"#)
                 close(fd)
@@ -907,11 +945,15 @@ final class HookServer: @unchecked Sendable {
         }
         activeSessionId = sessionId
 
+        let externalAgent = (isAntigravityRequest || isOpenCodeRequest || isCopilotRequest || isMuseRequest || isHermesRequest) ? rawAgent : nil
         upsertTask(pill: pillId,
                    display: PillSessionRegistry.Display(session: sessionId, projectName: projectName,
                                                         cwd: cwd, hostApp: terminalHost?.bundleId,
                                                         bundleId: bundleId),
-                   working: true, externalAgent: nil)
+                   working: true, externalAgent: externalAgent)
+        if (payload["coucou_promoted_from"] as? String) == "PreToolUse" {
+            appendStep(id: pillId, step: localizedStep(tool: tool, input: toolInput))
+        }
         state.updateTask(id: pillId, state: .approval)
         SoundEngine.shared.play("approval")
 
@@ -930,8 +972,8 @@ final class HookServer: @unchecked Sendable {
 
         // Safety timeout — drop without a decision. nb-hook reads EOF from the cancel
         // handler's close and exits; the agent asks again itself.
-        // Copilot/Muse use 110s (their relay waits 118s but their hook timeout is 120s, leaving little margin).
-        let waitTimeout: Double = (isCopilotRequest || isMuseRequest) ? 110 : 115
+        // Copilot/Muse/Antigravity/Cursor/OpenCode use 110s (their relay waits 118s and their hook timeout is 120s).
+        let waitTimeout: Double = (isCopilotRequest || isMuseRequest || isAntigravityRequest || isCursorAgentRequest || isOpenCodeRequest) ? 110 : 115
         DispatchQueue.main.asyncAfter(deadline: .now() + waitTimeout) { [weak self] in
             guard let self, self.approvals.contains(id: entryId) else { return }
             self.removeApproval(id: entryId, note: self.waitingNote(pill: capturedPillId))
@@ -1930,13 +1972,14 @@ final class HookServer: @unchecked Sendable {
         var root = try Self.strictReadJSONObject(at: Self.agyHooksURL,
                                                  label: "~/.gemini/config/hooks.json")
         let base = hookBase()
-        // PreToolUse / PostToolUse: tool-level hooks — use matcher group
-        // PreInvocation / PostInvocation / Stop: lifecycle hooks — direct handler, no matcher
+        // PreToolUse / PostToolUse: tool-level hooks — use matcher group.
+        // PreToolUse gets a 120s timeout so Coucou can wait for an Allow/Deny click in the notch.
+        // PreInvocation / PostInvocation / Stop: lifecycle hooks — direct handler, no matcher.
         var coucou: [String: Any] = [:]
-        for event in ["PreToolUse", "PostToolUse"] {
+        for (event, timeout) in [("PreToolUse", 120), ("PostToolUse", 10)] {
             let hook: [String: Any] = ["type": "command",
                                        "command": "\(base) --agent antigravity \(event)",
-                                       "timeout": 10]
+                                       "timeout": timeout]
             coucou[event] = [["matcher": "*", "hooks": [hook]]]
         }
         for event in ["PreInvocation", "PostInvocation", "Stop"] {
@@ -2412,7 +2455,8 @@ final class HookServer: @unchecked Sendable {
             .replacingOccurrences(of: "'", with: "\\'")
         return """
 // Coucou hook plugin for OpenCode — generated by Coucou.app
-// Forwards every event to the Coucou notch (fire-and-forget, never blocks).
+// Forwards every event to the Coucou notch and relays permission decisions
+// when OpenCode's own permission config says "ask".
 import { spawn } from 'node:child_process';
 
 const HOOK = '\(path)';
@@ -2421,48 +2465,208 @@ const EVENT_MAP = {
   'session.idle': 'Stop',
   'session.error': 'StopFailure',
   'session.deleted': 'SessionEnd',
-  'permission.asked': 'PermissionRequest',
 };
 
+const pendingRelays = new Map();
+
 function forward(hook_event_name, payload) {
-  const p = spawn('/bin/sh', [HOOK, '--agent', 'opencode'],
-                  { stdio: ['pipe', 'ignore', 'ignore'], detached: true });
-  p.on('error', () => {});
-  p.stdin.on('error', () => {});
-  p.stdin.write(JSON.stringify({ hook_event_name, ...payload }) + '\\n');
-  p.stdin.end();
-  p.unref();
+  try {
+    const p = spawn('/bin/sh', [HOOK, '--agent', 'opencode'],
+                    { stdio: ['pipe', 'ignore', 'ignore'], detached: true });
+    p.on('error', () => {});
+    p.stdin.on('error', () => {});
+    p.stdin.write(JSON.stringify({ hook_event_name, ...payload }) + '\\n');
+    p.stdin.end();
+    p.unref();
+  } catch {}
 }
 
-export const CoucouPlugin = async (_ctx) => ({
-  event: async ({ event }) => {
-    const hook_event_name = EVENT_MAP[event.type];
-    if (!hook_event_name) return;
-    const props = event.properties || {};
-    const payload = {
-      session_id: event.sessionID || event.session_id || props.sessionID || props.session_id || '',
-      cwd: event.cwd || event.directory || props.cwd || props.directory || '',
-    };
-    if (typeof props.tool === 'string') payload.tool_name = props.tool;
-    if (props.input != null) payload.tool_input = props.input;
-    forward(hook_event_name, payload);
+function requestDecision(key, payload) {
+  return new Promise((resolve) => {
+    try {
+      const p = spawn('/bin/sh', [HOOK, '--agent', 'opencode'],
+                      { stdio: ['pipe', 'pipe', 'ignore'] });
+      if (key) pendingRelays.set(key, p);
+      let out = '';
+      const done = (val) => {
+        if (key) pendingRelays.delete(key);
+        resolve(val);
+      };
+      p.stdout.on('data', (chunk) => { out += chunk.toString(); });
+      p.on('error', () => done(null));
+      p.on('close', () => {
+        try {
+          done(JSON.parse(out.trim()));
+        } catch {
+          done(null);
+        }
+      });
+      p.stdin.on('error', () => {});
+      p.stdin.write(JSON.stringify({ hook_event_name: 'PermissionRequest', ...payload }) + '\\n');
+      p.stdin.end();
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+function cancelPending(key) {
+  if (key && pendingRelays.has(key)) {
+    try { pendingRelays.get(key).kill(); } catch {}
+    pendingRelays.delete(key);
+    return;
+  }
+  for (const [k, proc] of pendingRelays.entries()) {
+    try { proc.kill(); } catch {}
+    pendingRelays.delete(k);
+  }
+}
+
+function buildPermissionPayload(info, dir) {
+  const meta = info?.metadata || {};
+  const tool = info?.type || info?.tool || info?.permission || 'permission';
+  const cmd = info?.title || info?.message || meta.command || (Array.isArray(info?.pattern) ? info.pattern.join(' ') : info?.pattern) || '';
+  const filePath = meta.filePath || meta.path || meta.file_path || '';
+  const toolInput = { ...meta };
+  if (cmd && !toolInput.command) toolInput.command = String(cmd);
+  if (filePath && !toolInput.file_path) toolInput.file_path = String(filePath);
+  return {
+    session_id: info?.sessionID || info?.session_id || '',
+    cwd: dir || info?.cwd || info?.directory || '',
+    tool_name: String(tool),
+    tool_input: toolInput,
+  };
+}
+
+export const CoucouPlugin = async ({ directory, client } = {}) => {
+  let handledByHook = false;
+  return {
+    event: async ({ event }) => {
+      const type = event?.type;
+      const props = event?.properties || {};
+      if (type === 'permission.replied' || type === 'permission.updated') {
+        cancelPending(props.permissionID || props.requestID || props.id);
+        return;
+      }
+      if (type === 'permission.asked' && !handledByHook) {
+        const reqId = props.id || props.permissionID || props.requestID || '';
+        const sessionId = props.sessionID || event?.sessionID || '';
+        const res = await requestDecision(reqId || sessionId, buildPermissionPayload(props, directory));
+        const decision = res?.permissionDecision;
+        if ((decision === 'allow' || decision === 'deny') && client?.postSessionIdPermissionsPermissionId && sessionId && reqId) {
+          try {
+            await client.postSessionIdPermissionsPermissionId({
+              path: { id: sessionId, permissionID: reqId },
+              body: { response: decision === 'allow' ? 'once' : 'reject' },
+            });
+          } catch {}
+        }
+        return;
+      }
+      const hook_event_name = EVENT_MAP[type];
+      if (!hook_event_name) return;
+      if (hook_event_name === 'Stop' || hook_event_name === 'StopFailure' || hook_event_name === 'SessionEnd') {
+        cancelPending();
+      }
+      const payload = {
+        session_id: event?.sessionID || event?.session_id || props.sessionID || props.session_id || '',
+        cwd: directory || event?.cwd || event?.directory || props.cwd || props.directory || '',
+      };
+      if (typeof props.tool === 'string') payload.tool_name = props.tool;
+      if (props.input != null) payload.tool_input = props.input;
+      forward(hook_event_name, payload);
+    },
+    'permission.ask': async (input, output) => {
+      if (output && output.status && output.status !== 'ask') return;
+      handledByHook = true;
+      const key = input?.id || input?.sessionID || '';
+      const res = await requestDecision(key, buildPermissionPayload(input, directory));
+      const decision = res?.permissionDecision;
+      if (output && (decision === 'allow' || decision === 'deny')) {
+        output.status = decision;
+      }
+    },
+    'tool.execute.before': async (input, output) => {
+      forward('PreToolUse', {
+        session_id: input?.sessionID || input?.session_id || '',
+        cwd: directory || input?.cwd || '',
+        tool_name: typeof input?.tool === 'string' ? input.tool : '',
+        tool_input: output?.args ?? input?.input ?? null,
+      });
+    },
+    'tool.execute.after': async (input, _output) => {
+      forward('PostToolUse', {
+        session_id: input?.sessionID || input?.session_id || '',
+        cwd: directory || input?.cwd || '',
+        tool_name: typeof input?.tool === 'string' ? input.tool : '',
+      });
+    },
+  };
+};
+
+export default {
+  id: 'coucou',
+  setup: async (ctx = {}) => {
+    const dir = ctx.directory || '';
+    if (ctx.permission?.hook) {
+      try {
+        ctx.permission.hook('evaluate', async (event) => {
+          if (event?.effect && event.effect !== 'ask') return;
+          const key = event?.id || event?.sessionID || '';
+          const res = await requestDecision(key, buildPermissionPayload(event, dir));
+          const decision = res?.permissionDecision;
+          if (decision === 'allow' || decision === 'deny') {
+            event.effect = decision;
+          }
+        });
+      } catch {}
+    }
+    if (ctx.tool?.hook) {
+      try {
+        ctx.tool.hook('execute.before', async (input, output) => {
+          forward('PreToolUse', {
+            session_id: input?.sessionID || '',
+            cwd: dir,
+            tool_name: typeof input?.tool === 'string' ? input.tool : '',
+            tool_input: output?.args ?? input?.input ?? null,
+          });
+        });
+        ctx.tool.hook('execute.after', async (input) => {
+          forward('PostToolUse', {
+            session_id: input?.sessionID || '',
+            cwd: dir,
+            tool_name: typeof input?.tool === 'string' ? input.tool : '',
+          });
+        });
+      } catch {}
+    }
+    if (ctx.event?.subscribe) {
+      (async () => {
+        try {
+          for await (const event of ctx.event.subscribe()) {
+            const type = event?.type;
+            const props = event?.properties || {};
+            if (type === 'permission.replied' || type === 'permission.updated') {
+              cancelPending(props.permissionID || props.requestID || props.id);
+              continue;
+            }
+            const hook_event_name = EVENT_MAP[type];
+            if (!hook_event_name) continue;
+            if (hook_event_name === 'Stop' || hook_event_name === 'StopFailure' || hook_event_name === 'SessionEnd') {
+              cancelPending();
+            }
+            forward(hook_event_name, {
+              session_id: props.sessionID || props.info?.id || event?.sessionID || '',
+              cwd: dir,
+            });
+          }
+        } catch {}
+      })();
+    }
+    return CoucouPlugin(ctx);
   },
-  'tool.execute.before': async (input) => {
-    forward('PreToolUse', {
-      session_id: input.sessionID || input.session_id || '',
-      cwd: input.cwd || '',
-      tool_name: typeof input.tool === 'string' ? input.tool : '',
-      tool_input: input.input ?? null,
-    });
-  },
-  'tool.execute.after': async (input, _output) => {
-    forward('PostToolUse', {
-      session_id: input.sessionID || input.session_id || '',
-      cwd: input.cwd || '',
-      tool_name: typeof input.tool === 'string' ? input.tool : '',
-    });
-  },
-});
+  server: CoucouPlugin,
+};
 """
     }
 
@@ -3249,17 +3453,25 @@ fi
 if [ -n "$out" ]; then
     printf '%s\\n' "$out"
 else
-    # Copilot is fail-closed — must always output valid JSON even when python3 is absent or crashes.
-    _cop=0; _perm=0
+    # Copilot and Antigravity PreToolUse are fail-closed — must always output valid JSON even when python3 is absent or crashes.
+    _cop=0; _agy=0; _perm=0; _pre=0
     for _a in "$@"; do
         case "$_a" in
             copilot) _cop=1 ;;
+            antigravity) _agy=1 ;;
             permissionRequest|PermissionRequest) _perm=1 ;;
+            preToolUse|PreToolUse) _pre=1 ;;
         esac
     done
     if [ "$_cop" -eq 1 ]; then
         if [ "$_perm" -eq 1 ]; then
             printf '{"permissionDecision":"ask"}\\n'
+        else
+            printf '{}\\n'
+        fi
+    elif [ "$_agy" -eq 1 ]; then
+        if [ "$_pre" -eq 1 ] || [ "$_perm" -eq 1 ]; then
+            printf '{"decision":"ask"}\\n'
         else
             printf '{}\\n'
         fi
@@ -3274,7 +3486,7 @@ private let nbHookPythonGitHub = """
 #!/usr/bin/env python3
 # nb-hook.py — Coucou hook relay for Claude Code and third-party agents (GitHub version)
 # Reads JSON from stdin, forwards to Coucou via Unix socket, translates response.
-import sys, json, os, socket
+import sys, json, os, socket, urllib.parse
 
 def normalize_event(name):
     mapping = {
@@ -3290,6 +3502,9 @@ def normalize_event(name):
         'agentStop': 'Stop', 'notification': 'Notification',
         'preToolUse': 'PreToolUse', 'postToolUse': 'PostToolUse',
         'permissionRequest': 'PermissionRequest', 'sessionEnd': 'SessionEnd',
+        'beforeSubmitPrompt': 'UserPromptSubmit', 'beforeShellExecution': 'PreToolUse',
+        'postToolUseFailure': 'PostToolUseFailure',
+        'subagentStart': 'SubagentStart', 'subagentStop': 'SubagentStop',
     }
     return mapping.get(name, name)
 
@@ -3303,6 +3518,8 @@ def normalize_tool_fields(payload):
             if not isinstance(tool, dict):
                 tool = {}
             name = tool.get('name') or payload.get('tool', '')
+            if not name and payload.get('command'):
+                name = 'Bash'
             if name:
                 payload['tool_name'] = name
     if 'tool_input' not in payload:
@@ -3319,6 +3536,8 @@ def normalize_tool_fields(payload):
                     if src in flat:
                         flat[dst] = flat[src]
                 payload['tool_input'] = flat
+            elif isinstance(payload.get('command'), str) and payload['command']:
+                payload['tool_input'] = {'command': payload['command']}
     if 'session_id' not in payload:
         for k in ['conversationId', 'conversation_id', 'sessionId', 'GEMINI_SESSION_ID']:
             if payload.get(k):
@@ -3331,6 +3550,143 @@ def normalize_tool_fields(payload):
     # Copilot sends workdir for the current working directory
     if not payload.get('cwd') and payload.get('workdir'):
         payload['cwd'] = payload['workdir']
+
+def _norm_path(p):
+    s = (p or '').strip().replace('\\\\', '/').rstrip('/')
+    return s or '/'
+
+def _is_inside_workspaces(target, workspaces):
+    norm = _norm_path(target)
+    if not norm or not norm.startswith('/'):
+        return '..' not in norm.split('/')
+    for w in workspaces:
+        root = _norm_path(w)
+        if root and (norm == root or norm.startswith(root + '/')):
+            return True
+    return False
+
+def _uri_to_path(uri):
+    if not isinstance(uri, str) or not uri.startswith('file://'):
+        return ''
+    return urllib.parse.unquote(uri[7:])
+
+def _agy_needs_approval(payload):
+    tool = payload.get('tool_name', '')
+    inp = payload.get('tool_input') if isinstance(payload.get('tool_input'), dict) else {}
+    workspaces = payload.get('workspacePaths') or payload.get('workspace_roots') or []
+    if not isinstance(workspaces, list):
+        workspaces = []
+    if not workspaces and payload.get('cwd'):
+        workspaces = [payload['cwd']]
+
+    preset = ''
+    auto_exec = ''
+    non_ws = ''
+    grants = []
+    cfg_dir = os.path.expanduser('~/.gemini/config')
+    try:
+        with open(os.path.join(cfg_dir, 'config.json'), 'r') as f:
+            user = (json.load(f) or {}).get('userSettings') or {}
+            preset = user.get('permissionPreset') or preset
+            auto_exec = user.get('autoExecutionPolicy') or auto_exec
+            non_ws = user.get('nonWorkspaceFileAccessPolicy') or non_ws
+            allow = (user.get('globalPermissionGrants') or {}).get('allow') or []
+            if isinstance(allow, list):
+                grants.extend(str(x) for x in allow)
+    except Exception:
+        pass
+
+    proj_dir = os.path.join(cfg_dir, 'projects')
+    if workspaces and os.path.isdir(proj_dir):
+        try:
+            ws_norms = {_norm_path(w) for w in workspaces if isinstance(w, str)}
+            for fn in os.listdir(proj_dir):
+                if not fn.endswith('.json'):
+                    continue
+                try:
+                    with open(os.path.join(proj_dir, fn), 'r') as f:
+                        proj = json.load(f) or {}
+                    uris = []
+                    for r in ((proj.get('projectResources') or {}).get('resources') or []):
+                        if isinstance(r, dict) and r.get('folderUri'):
+                            uris.append(r['folderUri'])
+                    gf = (proj.get('gitFolder') or {}).get('folderUri')
+                    if gf:
+                        uris.append(gf)
+                    if any(_norm_path(_uri_to_path(u)) in ws_norms for u in uris):
+                        ag = proj.get('agentSettings') or {}
+                        preset = ag.get('permissionPreset') or preset
+                        auto_exec = ag.get('autoExecutionPolicy') or auto_exec
+                        non_ws = ag.get('nonWorkspaceFileAccessPolicy') or non_ws
+                        allow = (ag.get('permissionGrants') or {}).get('allow') or []
+                        if isinstance(allow, list):
+                            grants.extend(str(x) for x in allow)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    if preset == 'AGENT_PERMISSION_PRESET_TURBO' or auto_exec == 'CASCADE_COMMANDS_AUTO_EXECUTION_EAGER':
+        return False
+
+    if tool == 'run_command':
+        cmd = (inp.get('command') or inp.get('CommandLine') or '').strip()
+        if not cmd:
+            return False
+        for g in grants:
+            if g.startswith('command(') and g.endswith(')'):
+                pat = g[8:-1].strip()
+                if not pat:
+                    continue
+                if pat == '*':
+                    return False
+                if pat.endswith('*'):
+                    pfx = pat[:-1].rstrip()
+                    if cmd == pfx or cmd.startswith(pfx):
+                        return False
+                elif cmd == pat or (cmd.startswith(pat) and cmd[len(pat):len(pat)+1].isspace()):
+                    return False
+        return True
+
+    if tool in ('write_file', 'edit_file', 'write_to_file', 'replace_file_content', 'multi_replace_file_content'):
+        if non_ws == 'AGENT_SETTING_POLICY_ALLOW' or not workspaces:
+            return False
+        target = (inp.get('file_path') or inp.get('path') or inp.get('Path') or inp.get('FilePath') or '').strip()
+        if not target:
+            return False
+        return not _is_inside_workspaces(target, workspaces)
+
+    return False
+
+def _cursor_needs_approval(payload):
+    tool = (payload.get('tool_name') or '').strip()
+    inp = payload.get('tool_input') if isinstance(payload.get('tool_input'), dict) else {}
+    if tool.lower() in ('bash', 'shell', 'run', 'powershell', 'run_terminal_cmd', 'execute_command', 'run_command'):
+        return True
+    if isinstance(inp.get('command'), str) and inp['command'].strip():
+        return True
+    if tool.lower() in ('write', 'edit', 'multiedit', 'delete', 'write_file', 'edit_file', 'edit_notebook', 'notebookedit'):
+        target = (inp.get('file_path') or inp.get('path') or inp.get('target_file') or '').strip()
+        if not target:
+            return False
+        roots = payload.get('workspace_roots') or payload.get('workspacePaths') or []
+        if not isinstance(roots, list):
+            roots = []
+        if not roots and payload.get('cwd'):
+            roots = [payload['cwd']]
+        if not roots:
+            return False
+        return not _is_inside_workspaces(target, roots)
+    return False
+
+def should_promote_to_permission_request(agent, event, payload):
+    if event != 'PreToolUse':
+        return False
+    if agent == 'antigravity':
+        return _agy_needs_approval(payload)
+    if agent == 'cursor':
+        return _cursor_needs_approval(payload)
+    return False
 
 def add_session_name(payload):
     # Name the pill after the folder the session started in, not the current cwd (the
@@ -3505,6 +3861,12 @@ def main():
         if raw_event:
             payload['hook_event_name'] = normalize_event(raw_event)
         normalize_tool_fields(payload)
+        cur_event = payload.get('hook_event_name', '')
+        if cur_event == 'Stop' and payload.get('status') == 'error':
+            payload['hook_event_name'] = 'StopFailure'
+        elif should_promote_to_permission_request(agent, cur_event, payload):
+            payload['coucou_promoted_from'] = cur_event
+            payload['hook_event_name'] = 'PermissionRequest'
     except Exception:
         pass
 
@@ -3541,8 +3903,11 @@ def main():
                         sys.stdout.flush()
                     sys.exit(0)
                 if decision in ('allow', 'always'):
-                    # Copilot/Muse use {"permissionDecision":"allow"} directly
-                    if agent in ('copilot', 'muse'):
+                    if agent == 'antigravity':
+                        out = {'decision': 'allow'}
+                    elif agent == 'cursor':
+                        out = {'permission': 'allow'}
+                    elif agent in ('copilot', 'muse', 'opencode'):
                         out = {'permissionDecision': 'allow'}
                     elif decision == 'always' and agent != 'codex':
                         # Let Claude Code persist the rule via updatedPermissions
@@ -3562,7 +3927,11 @@ def main():
                     sys.stdout.flush()
                     sys.exit(0)
                 elif decision == 'deny':
-                    if agent in ('copilot', 'muse'):
+                    if agent == 'antigravity':
+                        out = {'decision': 'deny', 'reason': 'Denied from Coucou'}
+                    elif agent == 'cursor':
+                        out = {'permission': 'deny', 'user_message': 'Denied from Coucou', 'agent_message': 'Denied from Coucou'}
+                    elif agent in ('copilot', 'muse', 'opencode'):
                         out = {'permissionDecision': 'deny'}
                     else:
                         out = {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': {'behavior': 'deny', 'message': 'Denied from Coucou'}}}
@@ -3572,8 +3941,11 @@ def main():
                 elif decision == 'answer':
                     # AskUserQuestion answered from the notch
                     answers = resp_obj.get('answers', {})
-                    questions = payload.get('tool_input', {}).get('questions', [])
-                    out = {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': {'behavior': 'allow', 'updatedInput': {'questions': questions, 'answers': answers}}}}
+                    if agent == 'opencode':
+                        out = {'permissionDecision': 'answer', 'answers': answers}
+                    else:
+                        questions = payload.get('tool_input', {}).get('questions', [])
+                        out = {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': {'behavior': 'allow', 'updatedInput': {'questions': questions, 'answers': answers}}}}
                     sys.stdout.write(json.dumps(out) + '\\n')
                     sys.stdout.flush()
                     sys.exit(0)
@@ -3584,14 +3956,15 @@ def main():
                     sys.stdout.write(json.dumps(out) + '\\n')
                     sys.stdout.flush()
                     sys.exit(0)
-                # 'ask' or unknown: fall through → no output → agent re-asks
+                # 'ask' or unknown: fall through → fallback output → agent re-asks
         except Exception:
             pass
-        # App unreachable, timed out, or no explicit decision — print nothing
-        # Copilot is fail-closed: must always output valid JSON so it re-asks rather than deny
-        # Hermes: no output → json.loads raises in plugin → transport_fallback: builtin activates
-        if agent == 'copilot':
+        # App unreachable, timed out, or no explicit decision — print fallback JSON when required.
+        if agent in ('copilot', 'opencode'):
             sys.stdout.write('{"permissionDecision":"ask"}\\n')
+            sys.stdout.flush()
+        elif agent == 'antigravity':
+            sys.stdout.write('{"decision":"ask"}\\n')
             sys.stdout.flush()
         sys.exit(0)
 
@@ -3627,7 +4000,7 @@ private let nbHookPythonAppStore = """
 #!/usr/bin/env python3
 # nb-hook.py — Coucou (App Store) hook relay for Claude Code and third-party agents
 # Socket lives inside the sandboxed container; script runs outside the sandbox.
-import sys, json, os, socket
+import sys, json, os, socket, urllib.parse
 
 def normalize_event(name):
     mapping = {
@@ -3643,6 +4016,9 @@ def normalize_event(name):
         'agentStop': 'Stop', 'notification': 'Notification',
         'preToolUse': 'PreToolUse', 'postToolUse': 'PostToolUse',
         'permissionRequest': 'PermissionRequest', 'sessionEnd': 'SessionEnd',
+        'beforeSubmitPrompt': 'UserPromptSubmit', 'beforeShellExecution': 'PreToolUse',
+        'postToolUseFailure': 'PostToolUseFailure',
+        'subagentStart': 'SubagentStart', 'subagentStop': 'SubagentStop',
     }
     return mapping.get(name, name)
 
@@ -3656,6 +4032,8 @@ def normalize_tool_fields(payload):
             if not isinstance(tool, dict):
                 tool = {}
             name = tool.get('name') or payload.get('tool', '')
+            if not name and payload.get('command'):
+                name = 'Bash'
             if name:
                 payload['tool_name'] = name
     if 'tool_input' not in payload:
@@ -3672,6 +4050,8 @@ def normalize_tool_fields(payload):
                     if src in flat:
                         flat[dst] = flat[src]
                 payload['tool_input'] = flat
+            elif isinstance(payload.get('command'), str) and payload['command']:
+                payload['tool_input'] = {'command': payload['command']}
     if 'session_id' not in payload:
         for k in ['conversationId', 'conversation_id', 'sessionId', 'GEMINI_SESSION_ID']:
             if payload.get(k):
@@ -3684,6 +4064,143 @@ def normalize_tool_fields(payload):
     # Copilot sends workdir for the current working directory
     if not payload.get('cwd') and payload.get('workdir'):
         payload['cwd'] = payload['workdir']
+
+def _norm_path(p):
+    s = (p or '').strip().replace('\\\\', '/').rstrip('/')
+    return s or '/'
+
+def _is_inside_workspaces(target, workspaces):
+    norm = _norm_path(target)
+    if not norm or not norm.startswith('/'):
+        return '..' not in norm.split('/')
+    for w in workspaces:
+        root = _norm_path(w)
+        if root and (norm == root or norm.startswith(root + '/')):
+            return True
+    return False
+
+def _uri_to_path(uri):
+    if not isinstance(uri, str) or not uri.startswith('file://'):
+        return ''
+    return urllib.parse.unquote(uri[7:])
+
+def _agy_needs_approval(payload):
+    tool = payload.get('tool_name', '')
+    inp = payload.get('tool_input') if isinstance(payload.get('tool_input'), dict) else {}
+    workspaces = payload.get('workspacePaths') or payload.get('workspace_roots') or []
+    if not isinstance(workspaces, list):
+        workspaces = []
+    if not workspaces and payload.get('cwd'):
+        workspaces = [payload['cwd']]
+
+    preset = ''
+    auto_exec = ''
+    non_ws = ''
+    grants = []
+    cfg_dir = os.path.expanduser('~/.gemini/config')
+    try:
+        with open(os.path.join(cfg_dir, 'config.json'), 'r') as f:
+            user = (json.load(f) or {}).get('userSettings') or {}
+            preset = user.get('permissionPreset') or preset
+            auto_exec = user.get('autoExecutionPolicy') or auto_exec
+            non_ws = user.get('nonWorkspaceFileAccessPolicy') or non_ws
+            allow = (user.get('globalPermissionGrants') or {}).get('allow') or []
+            if isinstance(allow, list):
+                grants.extend(str(x) for x in allow)
+    except Exception:
+        pass
+
+    proj_dir = os.path.join(cfg_dir, 'projects')
+    if workspaces and os.path.isdir(proj_dir):
+        try:
+            ws_norms = {_norm_path(w) for w in workspaces if isinstance(w, str)}
+            for fn in os.listdir(proj_dir):
+                if not fn.endswith('.json'):
+                    continue
+                try:
+                    with open(os.path.join(proj_dir, fn), 'r') as f:
+                        proj = json.load(f) or {}
+                    uris = []
+                    for r in ((proj.get('projectResources') or {}).get('resources') or []):
+                        if isinstance(r, dict) and r.get('folderUri'):
+                            uris.append(r['folderUri'])
+                    gf = (proj.get('gitFolder') or {}).get('folderUri')
+                    if gf:
+                        uris.append(gf)
+                    if any(_norm_path(_uri_to_path(u)) in ws_norms for u in uris):
+                        ag = proj.get('agentSettings') or {}
+                        preset = ag.get('permissionPreset') or preset
+                        auto_exec = ag.get('autoExecutionPolicy') or auto_exec
+                        non_ws = ag.get('nonWorkspaceFileAccessPolicy') or non_ws
+                        allow = (ag.get('permissionGrants') or {}).get('allow') or []
+                        if isinstance(allow, list):
+                            grants.extend(str(x) for x in allow)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    if preset == 'AGENT_PERMISSION_PRESET_TURBO' or auto_exec == 'CASCADE_COMMANDS_AUTO_EXECUTION_EAGER':
+        return False
+
+    if tool == 'run_command':
+        cmd = (inp.get('command') or inp.get('CommandLine') or '').strip()
+        if not cmd:
+            return False
+        for g in grants:
+            if g.startswith('command(') and g.endswith(')'):
+                pat = g[8:-1].strip()
+                if not pat:
+                    continue
+                if pat == '*':
+                    return False
+                if pat.endswith('*'):
+                    pfx = pat[:-1].rstrip()
+                    if cmd == pfx or cmd.startswith(pfx):
+                        return False
+                elif cmd == pat or (cmd.startswith(pat) and cmd[len(pat):len(pat)+1].isspace()):
+                    return False
+        return True
+
+    if tool in ('write_file', 'edit_file', 'write_to_file', 'replace_file_content', 'multi_replace_file_content'):
+        if non_ws == 'AGENT_SETTING_POLICY_ALLOW' or not workspaces:
+            return False
+        target = (inp.get('file_path') or inp.get('path') or inp.get('Path') or inp.get('FilePath') or '').strip()
+        if not target:
+            return False
+        return not _is_inside_workspaces(target, workspaces)
+
+    return False
+
+def _cursor_needs_approval(payload):
+    tool = (payload.get('tool_name') or '').strip()
+    inp = payload.get('tool_input') if isinstance(payload.get('tool_input'), dict) else {}
+    if tool.lower() in ('bash', 'shell', 'run', 'powershell', 'run_terminal_cmd', 'execute_command', 'run_command'):
+        return True
+    if isinstance(inp.get('command'), str) and inp['command'].strip():
+        return True
+    if tool.lower() in ('write', 'edit', 'multiedit', 'delete', 'write_file', 'edit_file', 'edit_notebook', 'notebookedit'):
+        target = (inp.get('file_path') or inp.get('path') or inp.get('target_file') or '').strip()
+        if not target:
+            return False
+        roots = payload.get('workspace_roots') or payload.get('workspacePaths') or []
+        if not isinstance(roots, list):
+            roots = []
+        if not roots and payload.get('cwd'):
+            roots = [payload['cwd']]
+        if not roots:
+            return False
+        return not _is_inside_workspaces(target, roots)
+    return False
+
+def should_promote_to_permission_request(agent, event, payload):
+    if event != 'PreToolUse':
+        return False
+    if agent == 'antigravity':
+        return _agy_needs_approval(payload)
+    if agent == 'cursor':
+        return _cursor_needs_approval(payload)
+    return False
 
 def add_session_name(payload):
     # Name the pill after the folder the session started in, not the current cwd (the
@@ -3857,6 +4374,12 @@ def main():
         if raw_event:
             payload['hook_event_name'] = normalize_event(raw_event)
         normalize_tool_fields(payload)
+        cur_event = payload.get('hook_event_name', '')
+        if cur_event == 'Stop' and payload.get('status') == 'error':
+            payload['hook_event_name'] = 'StopFailure'
+        elif should_promote_to_permission_request(agent, cur_event, payload):
+            payload['coucou_promoted_from'] = cur_event
+            payload['hook_event_name'] = 'PermissionRequest'
     except Exception:
         pass
 
@@ -3893,8 +4416,11 @@ def main():
                         sys.stdout.flush()
                     sys.exit(0)
                 if decision in ('allow', 'always'):
-                    # Copilot/Muse use {"permissionDecision":"allow"} directly
-                    if agent in ('copilot', 'muse'):
+                    if agent == 'antigravity':
+                        out = {'decision': 'allow'}
+                    elif agent == 'cursor':
+                        out = {'permission': 'allow'}
+                    elif agent in ('copilot', 'muse', 'opencode'):
                         out = {'permissionDecision': 'allow'}
                     elif decision == 'always' and agent != 'codex':
                         # Let Claude Code persist the rule via updatedPermissions
@@ -3914,7 +4440,11 @@ def main():
                     sys.stdout.flush()
                     sys.exit(0)
                 elif decision == 'deny':
-                    if agent in ('copilot', 'muse'):
+                    if agent == 'antigravity':
+                        out = {'decision': 'deny', 'reason': 'Denied from Coucou'}
+                    elif agent == 'cursor':
+                        out = {'permission': 'deny', 'user_message': 'Denied from Coucou', 'agent_message': 'Denied from Coucou'}
+                    elif agent in ('copilot', 'muse', 'opencode'):
                         out = {'permissionDecision': 'deny'}
                     else:
                         out = {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': {'behavior': 'deny', 'message': 'Denied from Coucou'}}}
@@ -3924,8 +4454,11 @@ def main():
                 elif decision == 'answer':
                     # AskUserQuestion answered from the notch
                     answers = resp_obj.get('answers', {})
-                    questions = payload.get('tool_input', {}).get('questions', [])
-                    out = {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': {'behavior': 'allow', 'updatedInput': {'questions': questions, 'answers': answers}}}}
+                    if agent == 'opencode':
+                        out = {'permissionDecision': 'answer', 'answers': answers}
+                    else:
+                        questions = payload.get('tool_input', {}).get('questions', [])
+                        out = {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': {'behavior': 'allow', 'updatedInput': {'questions': questions, 'answers': answers}}}}
                     sys.stdout.write(json.dumps(out) + '\\n')
                     sys.stdout.flush()
                     sys.exit(0)
@@ -3936,14 +4469,15 @@ def main():
                     sys.stdout.write(json.dumps(out) + '\\n')
                     sys.stdout.flush()
                     sys.exit(0)
-                # 'ask' or unknown: fall through → no output → agent re-asks
+                # 'ask' or unknown: fall through → fallback output → agent re-asks
         except Exception:
             pass
-        # App unreachable, timed out, or no explicit decision — print nothing
-        # Copilot is fail-closed: must always output valid JSON so it re-asks rather than deny
-        # Hermes: no output → json.loads raises in plugin → transport_fallback: builtin activates
-        if agent == 'copilot':
+        # App unreachable, timed out, or no explicit decision — print fallback JSON when required.
+        if agent in ('copilot', 'opencode'):
             sys.stdout.write('{"permissionDecision":"ask"}\\n')
+            sys.stdout.flush()
+        elif agent == 'antigravity':
+            sys.stdout.write('{"decision":"ask"}\\n')
             sys.stdout.flush()
         sys.exit(0)
 

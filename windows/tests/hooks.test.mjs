@@ -245,7 +245,7 @@ test("an agent's pill goes away when its session ends, or 5.2 s after it stops",
 });
 
 test("an agent's permission request is declined, never shown as Claude Code's", () => {
-  for (const agent of ["gemini", "antigravity", "cursor", "opencode", "amp", "hermes", "my-tool"]) {
+  for (const agent of ["gemini", "amp", "hermes", "my-tool"]) {
     calls.length = 0;
     hook({ hook_event_name: "PermissionRequest", request_id: "r1", coucou_agent: agent, tool_name: "Bash" });
     assert.deepEqual(sent("approval_decline"), [{ requestId: "r1" }], agent);
@@ -254,8 +254,8 @@ test("an agent's permission request is declined, never shown as Claude Code's", 
   }
 });
 
-test("Codex, Copilot CLI and Muse Code get the card on their own pill", () => {
-  for (const agent of ["codex", "copilot", "muse"]) {
+test("Codex, Copilot CLI, Muse Code, Antigravity, Cursor and OpenCode get the card on their own pill", () => {
+  for (const agent of ["codex", "copilot", "muse", "antigravity", "cursor", "opencode"]) {
     State.pendingApproval = null;
     State.focusId = CLAUDE;
     calls.length = 0;
@@ -263,6 +263,7 @@ test("Codex, Copilot CLI and Muse Code get the card on their own pill", () => {
     hook({
       hook_event_name: "PermissionRequest", request_id: `r-${agent}`, session_id: "s1",
       coucou_agent: agent, tool_name: "Bash", tool_input: { command: "npm publish" },
+      ...(agent === "antigravity" || agent === "cursor" ? { coucou_promoted_from: "PreToolUse" } : {}),
     });
     const id = `agent_${agent}`;
     assert.deepEqual(State.pendingApproval, {
@@ -270,6 +271,9 @@ test("Codex, Copilot CLI and Muse Code get the card on their own pill", () => {
     });
     assert.deepEqual(sent("approval_ack"), [{ requestId: `r-${agent}` }]);
     assert.deepEqual(sent("approval_decline"), []);
+    if (agent === "antigravity" || agent === "cursor") {
+      assert.deepEqual(task(id).steps, ["Runs · npm publish"]);
+    }
     // The same card as Claude Code's: it comes up and its pill comes to the
     // front, even from behind Claude Code's pill (unified with Mac #120).
     assert.equal(task(id).state, "approval");
@@ -312,6 +316,30 @@ test("only Claude Code's questions become a question card", () => {
   });
   assert.equal(State.pendingApproval.questions, undefined);
   assert.equal(task("agent_codex").state, "approval");
+
+  State.pendingApproval = null;
+  hook({
+    hook_event_name: "PermissionRequest", request_id: "r2", session_id: "s2", coucou_agent: "opencode",
+    tool_name: "question",
+    tool_input: { questions: [{ question: "Which?", options: [{ label: "A" }, { label: "B" }] }] },
+  });
+  assert.equal(State.pendingApproval.questions?.length, 1);
+  assert.equal(task("agent_opencode").state, "question");
+});
+
+test("a PostToolUse for the waiting session takes its approval card down and releases the relay", () => {
+  hook({
+    hook_event_name: "PermissionRequest", request_id: "r1", session_id: "s1",
+    coucou_agent: "antigravity", coucou_promoted_from: "PreToolUse",
+    tool_name: "run_command", tool_input: { CommandLine: "npm test" },
+  });
+  assert.equal(State.pendingApproval?.requestId, "r1");
+  hook({ hook_event_name: "PostToolUse", session_id: "other", coucou_agent: "antigravity", tool_name: "run_command" });
+  assert.equal(State.pendingApproval?.requestId, "r1");
+  hook({ hook_event_name: "PostToolUse", session_id: "s1", coucou_agent: "antigravity", tool_name: "run_command" });
+  assert.equal(State.pendingApproval, null);
+  assert.deepEqual(sent("approval_decline"), [{ requestId: "r1" }]);
+  assert.equal(task("agent_antigravity").state, "working");
 });
 
 test("the end of the turn takes a waiting card down and releases the relay", () => {
@@ -711,7 +739,9 @@ for (const tool_name of ["ask_question", "default_api:ask_question"]) {
     const active = task("agent_antigravity");
     assert.equal(active.state, "question");
     assert.equal(active.steps.at(-1), "Needs input · Which deployment strategy should we use?");
-    assert.deepEqual(asked, ["alert:overview"]);
+    assert.deepEqual(asked, ["alert:question"]);
+    assert.equal(State.focusId, "agent_antigravity");
+    assert.equal(State.isPinned, true);
     assert.deepEqual(sound.mock.calls.map((call) => call.arguments), [["question"]]);
     assert.equal(State.pendingApproval, null, "the answer stays in Antigravity");
     assert.deepEqual(sent("approval_ack"), []);
@@ -719,6 +749,8 @@ for (const tool_name of ["ask_question", "default_api:ask_question"]) {
     hook({ hook_event_name: "PostToolUse", coucou_agent: "antigravity", tool_name });
     assert.equal(active.state, "working");
     assert.equal(sound.mock.callCount(), 1);
+    assert.equal(State.isPinned, false);
+    assert.equal(State.focusId, CLAUDE);
   });
 }
 
@@ -749,5 +781,5 @@ test("Antigravity questions without usable text still alert with a translated la
     assert.equal(task("agent_antigravity").steps.at(-1), "Needs input");
   }
   assert.equal(asked.length, 5);
-  assert.ok(asked.every((request) => request === "alert:overview"));
+  assert.ok(asked.every((request) => request === "alert:question"));
 });

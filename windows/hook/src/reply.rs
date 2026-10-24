@@ -9,10 +9,14 @@
 use serde_json::{json, Map, Value};
 
 /// The agents whose permission requests the island can answer: Claude Code
-/// (no `--agent`), Codex, Copilot CLI and Muse Code. Any decision for another
-/// agent is ignored here too, whatever the app sent.
+/// (no `--agent`), Codex, Copilot CLI, Muse Code, Antigravity, Cursor Agent,
+/// and OpenCode. Any decision for another agent is ignored here too, whatever
+/// the app sent.
 pub fn takes_decisions(agent: &str) -> bool {
-    matches!(agent, "" | "codex" | "copilot" | "muse")
+    matches!(
+        agent,
+        "" | "codex" | "copilot" | "muse" | "antigravity" | "cursor" | "opencode"
+    )
 }
 
 /// Agents that read a JSON object on stdout after every hook and get `{}` —
@@ -27,7 +31,7 @@ fn wants_json(agent: &str) -> bool {
 pub fn stdout(agent: &str, event: &str, decision: Option<&str>, question: Option<&Value>) -> Option<String> {
     if event != "PermissionRequest" {
         // Antigravity reads "{}" on PreToolUse as a denial. "ask" keeps its own prompt
-        // (and the user's Always Allow): Coucou never allows a tool by itself.
+        // (and the user's Always Allow / Turbo mode): Coucou never allows a tool by itself.
         if agent.eq_ignore_ascii_case("antigravity") && event == "PreToolUse" {
             return Some(r#"{"decision":"ask"}"#.to_string());
         }
@@ -35,9 +39,48 @@ pub fn stdout(agent: &str, event: &str, decision: Option<&str>, question: Option
     }
     let decision = decision.filter(|_| takes_decisions(agent));
     match agent {
-        // Copilot CLI and Muse Code read a bare permissionDecision. Copilot is
-        // fail-closed: it must always get valid JSON, so silence is an "ask".
-        "copilot" | "muse" => {
+        // Antigravity evaluates PreToolUse (promoted to PermissionRequest) via {"decision": ...}.
+        // No decision (timeout, island closed/paused) MUST return {"decision":"ask"}, never "{}".
+        "antigravity" => match decision.map(str::trim) {
+            Some("allow" | "always") => Some(json!({ "decision": "allow" }).to_string()),
+            Some("deny") => Some(json!({ "decision": "deny", "reason": "Denied from Coucou" }).to_string()),
+            _ => Some(json!({ "decision": "ask" }).to_string()),
+        },
+        // Cursor Agent evaluates preToolUse / beforeShellExecution via {"permission": ...}.
+        // Silence or {"permission":"ask"} defers to Cursor's own UI.
+        "cursor" => match decision.map(str::trim) {
+            Some("allow" | "always") => Some(json!({ "permission": "allow" }).to_string()),
+            Some("deny") => Some(
+                json!({
+                    "permission": "deny",
+                    "user_message": "Denied from Coucou",
+                    "agent_message": "Denied from Coucou",
+                })
+                .to_string(),
+            ),
+            _ => None,
+        },
+        // Copilot CLI, Muse Code, and OpenCode read a bare permissionDecision.
+        // Copilot and OpenCode are given an explicit "ask" when nobody clicked.
+        "copilot" | "muse" | "opencode" => {
+            if agent == "opencode" {
+                if let Some(d) = decision.map(str::trim).filter(|s| s.starts_with('{')) {
+                    if let Some(reply) = serde_json::from_str::<Value>(d).ok() {
+                        if let (Some(answers), Some(q)) = (reply.get("answers").and_then(Value::as_object), question) {
+                            if answers_fit(q, answers) {
+                                return Some(
+                                    json!({
+                                        "permissionDecision": "answer",
+                                        "answers": answers,
+                                    })
+                                    .to_string(),
+                                );
+                            }
+                        }
+                    }
+                    return Some(json!({ "permissionDecision": "ask" }).to_string());
+                }
+            }
             let word = match decision.map(str::trim) {
                 Some("allow" | "always") => Some("allow"),
                 Some("deny") => Some("deny"),
@@ -45,12 +88,14 @@ pub fn stdout(agent: &str, event: &str, decision: Option<&str>, question: Option
             };
             match word {
                 Some(word) => Some(json!({ "permissionDecision": word }).to_string()),
-                None if agent == "copilot" => Some(json!({ "permissionDecision": "ask" }).to_string()),
+                None if matches!(agent, "copilot" | "opencode") => {
+                    Some(json!({ "permissionDecision": "ask" }).to_string())
+                }
                 None => None,
             }
         }
         // Claude Code and Codex share the documented hookSpecificOutput. Only
-        // Claude Code asks questions.
+        // Claude Code asks questions via hookSpecificOutput.
         "" => decision.and_then(|d| decision_json(d, question)),
         _ => decision.and_then(|d| decision_json(d, None)),
     }
@@ -193,16 +238,23 @@ mod tests {
             assert_eq!(stdout(agent, "PermissionRequest", None, None), None);
             assert_eq!(stdout(agent, "PreToolUse", None, None), None);
         }
-        for agent in ["copilot", "muse"] {
+        for agent in ["copilot", "muse", "opencode"] {
             assert_eq!(stdout(agent, "PermissionRequest", Some("allow"), None).unwrap(), r#"{"permissionDecision":"allow"}"#);
             assert_eq!(stdout(agent, "PermissionRequest", Some("deny"), None).unwrap(), r#"{"permissionDecision":"deny"}"#);
+        }
+        for agent in ["copilot", "muse"] {
             assert_eq!(stdout(agent, "PreToolUse", None, None).unwrap(), "{}");
         }
-        // Copilot is fail-closed: no decision is an explicit "ask", never silence.
+        // Copilot and OpenCode get an explicit "ask" when nobody clicked.
         assert_eq!(stdout("copilot", "PermissionRequest", None, None).unwrap(), r#"{"permissionDecision":"ask"}"#);
+        assert_eq!(stdout("opencode", "PermissionRequest", None, None).unwrap(), r#"{"permissionDecision":"ask"}"#);
         assert_eq!(stdout("muse", "PermissionRequest", None, None), None);
-        // Antigravity needs a decision on PreToolUse: "ask" leaves it to Antigravity's own prompt;
-        // other lifecycle events receive "{}".
+        // Antigravity: PreToolUse promoted to PermissionRequest returns {"decision":"allow"|"deny"|"ask"}.
+        // Non-promoted PreToolUse also returns {"decision":"ask"}; other lifecycle events receive "{}".
+        assert_eq!(stdout("antigravity", "PermissionRequest", Some("allow"), None).unwrap(), r#"{"decision":"allow"}"#);
+        assert_eq!(stdout("antigravity", "PermissionRequest", Some("always"), None).unwrap(), r#"{"decision":"allow"}"#);
+        assert_eq!(stdout("antigravity", "PermissionRequest", Some("deny"), None).unwrap(), r#"{"decision":"deny","reason":"Denied from Coucou"}"#);
+        assert_eq!(stdout("antigravity", "PermissionRequest", None, None).unwrap(), r#"{"decision":"ask"}"#);
         assert_eq!(stdout("antigravity", "PreToolUse", None, None).unwrap(), r#"{"decision":"ask"}"#);
         for event in ["PostToolUse", "UserPromptSubmit", "Stop"] {
             assert_eq!(stdout("antigravity", event, None, None).unwrap(), "{}");
@@ -211,7 +263,13 @@ mod tests {
         for event in ["PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop"] {
             assert_eq!(stdout("gemini", event, None, None).unwrap(), "{}");
         }
-        // Cursor: silence, which Cursor reads as "carry on as usual".
+        // Cursor: PermissionRequest returns {"permission":"allow"|"deny"} or silence to let Cursor prompt natively.
+        assert_eq!(stdout("cursor", "PermissionRequest", Some("allow"), None).unwrap(), r#"{"permission":"allow"}"#);
+        assert_eq!(
+            stdout("cursor", "PermissionRequest", Some("deny"), None).unwrap(),
+            r#"{"agent_message":"Denied from Coucou","permission":"deny","user_message":"Denied from Coucou"}"#
+        );
+        assert_eq!(stdout("cursor", "PermissionRequest", None, None), None);
         for event in ["PreToolUse", "UserPromptSubmit", "Stop"] {
             assert_eq!(stdout("cursor", event, None, None), None);
         }
@@ -247,7 +305,11 @@ mod tests {
         assert_eq!(decision["behavior"], "allow");
         assert_eq!(decision["updatedInput"]["questions"], question["questions"]);
         assert_eq!(decision["updatedInput"]["answers"]["Which one?"], "B");
-        // Only Claude Code asks questions: an answer for anyone else is nothing.
+        let out = stdout("opencode", "PermissionRequest", Some(r#"{"answers":{"Which one?":"B"}}"#), Some(&question)).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["permissionDecision"], "answer");
+        assert_eq!(v["answers"]["Which one?"], "B");
+        // Agents without question answer support return nothing for question answers.
         assert!(stdout("codex", "PermissionRequest", Some(r#"{"answers":{"Which one?":"B"}}"#), Some(&question)).is_none());
     }
 

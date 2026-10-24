@@ -156,7 +156,7 @@ export class Island {
    * waiting, the island stays on screen, and opening it shows the card again.
    */
   foldApproval() {
-    if (!State.pendingApproval || State.mode !== "expanded") return;
+    if ((!State.pendingApproval && State.focusTask?.state !== "question") || State.mode !== "expanded") return;
     State.isPinned = true;
     this.fsm.pinned = true;
     this.fsm.forcePetit();
@@ -182,7 +182,7 @@ export class Island {
         const task = State.focusTask;
         // Sessions from the Claude desktop app live there, not in a terminal.
         if (task?.id === CLAUDE_DESKTOP_ID) void Bridge.openClaudeDesktop();
-        else void Bridge.openSession(task?.sessionId ?? null, task?.sessionCwd ?? null);
+        else void Bridge.openSession(task?.sessionId ?? null, task?.sessionCwd ?? null, task?.id ?? null);
       },
       // The ↗ button — same targets as openAgentTarget() on macOS.
       openTarget: () => {
@@ -199,8 +199,8 @@ export class Island {
           integration_whatsapp: "https://web.whatsapp.com",
         };
         if (task.id === CLAUDE_DESKTOP_ID) void Bridge.openClaudeDesktop();
-        else if (task.id === "integration_claude" || task.sessionId) {
-          void Bridge.openSession(task.sessionId ?? null, task.sessionCwd ?? null);
+        else if (task.id === "integration_claude" || task.source === "agent" || task.sessionId) {
+          void Bridge.openSession(task.sessionId ?? null, task.sessionCwd ?? null, task.id);
         } else if (task.id === "integration_n8n") void Bridge.openN8n();
         else if (task.id === "integration_gitea") void Bridge.openGitea();
         else if (task.id === SPOTIFY_ID) void Bridge.spotifyOpen();

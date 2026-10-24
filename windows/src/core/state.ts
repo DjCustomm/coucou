@@ -510,6 +510,7 @@ class AppState {
    */
   defaultView(): IslandViewName {
     if (this.pendingApproval) return this.pendingApproval.questions ? "question" : "approval";
+    if (this.focusTask?.state === "question") return "question";
     return this.tasks.length === 0 ? "empty" : "overview";
   }
 }

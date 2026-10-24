@@ -61,6 +61,8 @@ interface HookPayload {
   tool_input?: Record<string, unknown>;
   /** Set by the relay when an edit was too big to forward whole (> 256 KB). */
   coucou_diff_truncated?: boolean;
+  /** Set by the relay when a PreToolUse (Antigravity / Cursor) was promoted to PermissionRequest. */
+  coucou_promoted_from?: string;
   /** Optional agent tag: lowercase, digits and hyphens, ≤ 24 chars. */
   coucou_agent?: string;
   /** Hermes: where the session runs (telegram, discord…; "cli" in a terminal). */
@@ -109,8 +111,12 @@ const TOOL_LABELS: Record<string, string> = {
   // Antigravity's tools (#298).
   run_command: N_("Runs"),
   view_file: N_("Reads"),
+  read_file: N_("Reads"),
   write_to_file: N_("Writes"),
+  write_file: N_("Writes"),
   replace_file_content: N_("Edits"),
+  multi_replace_file_content: N_("Edits"),
+  edit_file: N_("Edits"),
   read_url_content: N_("Fetches"),
   search_web: N_("Searches the web"),
   ask_question: N_("Needs input"),
@@ -175,7 +181,7 @@ function approvalTarget(tool: string, input: Record<string, unknown>): string {
  * as options to pick from. Anything it cannot is left to the terminal.
  */
 function askedQuestions(tool: string, input: Record<string, unknown>): AskedQuestion[] | null {
-  if (tool !== "AskUserQuestion" || !Array.isArray(input.questions)) return null;
+  if ((tool !== "AskUserQuestion" && tool !== "question") || !Array.isArray(input.questions)) return null;
   const out: AskedQuestion[] = [];
   for (const raw of input.questions as Record<string, unknown>[]) {
     const question = typeof raw?.question === "string" ? raw.question : "";
@@ -187,7 +193,7 @@ function askedQuestions(tool: string, input: Record<string, unknown>): AskedQues
       }));
     // A question cut short by the relay would be answered under the wrong text.
     if (!question || question.endsWith("…") || options.length < 2) return null;
-    out.push({ question, options, multiSelect: raw.multiSelect === true });
+    out.push({ question, options, multiSelect: raw.multiSelect === true || raw.multiple === true });
   }
   return out.length > 0 ? out : null;
 }
@@ -306,6 +312,20 @@ function handleHook(island: Island, payload: HookPayload) {
     if (cancelStopTimer(agentId)) State.setPillBadge(agentId, null);
   };
 
+  const finishWaitingQuestion = () => {
+    if (State.pendingApproval) return;
+    State.isPinned = false;
+    const previous = State.focusBeforeApproval;
+    State.focusBeforeApproval = null;
+    if (previous && State.focusId === agentId && State.tasks.some((t) => t.id === previous)) {
+      State.focusId = previous;
+    }
+    island.dropPin();
+    if (State.view === "question") {
+      island.setView("overview");
+    }
+  };
+
   // The turn that asked for a permission is over — answered in the terminal,
   // interrupted, or a new prompt — so the card would be lying. It goes, and the
   // relay is released without a decision. Same rule as the Mac.
@@ -320,6 +340,12 @@ function handleHook(island: Island, payload: HookPayload) {
     pendingTimeout = null;
     if (pending.requestId) void Bridge.approvalDecline(pending.requestId);
     dropPendingCard(island);
+  } else if (
+    !pending &&
+    TURN_OVER.has(name) &&
+    State.tasks.find((x) => x.id === agentId)?.state === "question"
+  ) {
+    finishWaitingQuestion();
   }
 
   // Read after the card above is dropped: its pill may have handed the front
@@ -359,8 +385,22 @@ function handleHook(island: Island, payload: HookPayload) {
       if (isQuestion) {
         State.updateTask(agentId, "question");
         State.appendStep(agentId, stepLabel(tool, payload.tool_input ?? {}));
+        const qList = payload.tool_input?.questions;
+        const firstQ = Array.isArray(qList) && qList.length > 0 ? qList[0] : null;
+        if (typeof firstQ === "object" && firstQ !== null && typeof (firstQ as Record<string, unknown>).question === "string") {
+          const qText = ((firstQ as Record<string, unknown>).question as string).trim();
+          const t = State.tasks.find((x) => x.id === agentId);
+          if (t && qText) t.finalLine = qText;
+        }
         Sound.play("question");
-        surface("overview", true);
+        if (!State.pendingApproval) {
+          State.isPinned = true;
+          if (State.focusBeforeApproval == null) State.focusBeforeApproval = State.focusId;
+          State.setFocus(agentId);
+          island.alert("question");
+        } else {
+          surface("overview", true);
+        }
       } else {
         State.updateTask(agentId, "working");
         State.appendStep(agentId, stepLabel(tool, payload.tool_input ?? {}));
@@ -371,17 +411,26 @@ function handleHook(island: Island, payload: HookPayload) {
 
     case "PostToolUse":
       supersedeStop();
-      // The question was answered in the terminal: the card would be lying.
+      // The question or permission was answered in the terminal/IDE: the card would be lying.
       if (
-        payload.tool_name === "AskUserQuestion" &&
-        State.pendingApproval?.questions &&
-        State.pendingApproval.sessionId === (payload.session_id ?? "")
+        State.pendingApproval &&
+        State.pendingApproval.pillId === agentId &&
+        State.pendingApproval.sessionId === (payload.session_id ?? "") &&
+        (payload.tool_name === "AskUserQuestion" ||
+          payload.tool_name === State.pendingApproval.tool ||
+          !payload.tool_name)
       ) {
         if (pendingTimeout != null) window.clearTimeout(pendingTimeout);
         pendingTimeout = null;
+        if (State.pendingApproval.requestId) void Bridge.approvalDecline(State.pendingApproval.requestId);
         dropPendingCard(island);
       }
+      const wasQuestion = !State.pendingApproval && State.tasks.find((x) => x.id === agentId)?.state === "question";
       State.updateTask(agentId, "working");
+      if (wasQuestion) {
+        clearFinalLine(agentId);
+        finishWaitingQuestion();
+      }
       recordDiff(agentId, payload);
       break;
 
@@ -493,13 +542,18 @@ function handleHook(island: Island, payload: HookPayload) {
       }
       ensurePill();
       supersedeStop();
+      clearFinalLine(agentId);
       if (pendingTimeout != null) window.clearTimeout(pendingTimeout);
       const tool = payload.tool_name ?? "Tool";
       const input = payload.tool_input ?? {};
-      // Claude Code asking a question is not a permission to grant: the island
-      // shows the options and sends back the one that was picked. Only Claude
-      // Code asks questions this way.
-      const questions = isExternalAgent ? null : askedQuestions(tool, input);
+      if (payload.coucou_promoted_from === "PreToolUse") {
+        State.appendStep(agentId, stepLabel(tool, input));
+      }
+      // Claude Code (or OpenCode's question tool) asking a question is not a
+      // permission to grant: the island shows the options and sends back the one
+      // that was picked.
+      const questions =
+        !isExternalAgent || validAgent === "opencode" ? askedQuestions(tool, input) : null;
       const view = questions ? "question" : "approval";
       // The card always comes up, even over another pill or an island that is
       // already open: its pill comes to the front, and the one you were on

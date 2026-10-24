@@ -3,7 +3,11 @@
 //! `normalize_tool_fields` in the Mac relay (HookServer.swift), plus Cursor's
 //! events.
 
+use std::path::Path;
+
 use serde_json::{Map, Value};
+
+use crate::antigravity;
 
 /// The canonical name of an agent's event. Unknown names pass through.
 pub fn event(name: &str) -> &str {
@@ -36,6 +40,7 @@ pub fn event(name: &str) -> &str {
         "sessionEnd" => "SessionEnd",
         // Cursor
         "beforeSubmitPrompt" => "UserPromptSubmit",
+        "beforeShellExecution" => "PreToolUse",
         "postToolUseFailure" => "PostToolUseFailure",
         "subagentStart" => "SubagentStart",
         "subagentStop" => "SubagentStop",
@@ -65,10 +70,16 @@ pub fn fields(map: &mut Map<String, Value>, env: &dyn Fn(&str) -> Option<String>
 
     if !map.contains_key("tool_name") {
         // Copilot: toolName. Gemini CLI / Antigravity: toolCall.name. Others: tool.
+        // Cursor's beforeShellExecution sends `command` at top level without `tool_name`.
         let name = non_empty_str(map, "toolName")
             .or_else(|| tool_call.as_ref().and_then(|t| non_empty_str(t, "name")))
             .or_else(|| non_empty_str(map, "tool"))
-            .map(str::to_string);
+            .map(str::to_string)
+            .or_else(|| {
+                (map.get("hook_event_name").and_then(Value::as_str) == Some("beforeShellExecution")
+                    || non_empty_str(map, "command").is_some())
+                .then(|| "Bash".to_string())
+            });
         if let Some(name) = name {
             map.insert("tool_name".into(), Value::String(name));
         }
@@ -83,15 +94,22 @@ pub fn fields(map: &mut Map<String, Value>, env: &dyn Fn(&str) -> Option<String>
                 .and_then(|v| v.as_object().cloned()),
             _ => None,
         };
-        let input = args.or_else(|| {
-            let mut flat = tool_call.as_ref()?.get("args")?.as_object()?.clone();
-            for (from, to) in ARG_ALIASES {
-                if let Some(v) = flat.get(*from).cloned() {
-                    flat.insert((*to).to_string(), v);
+        let input = args
+            .or_else(|| {
+                let mut flat = tool_call.as_ref()?.get("args")?.as_object()?.clone();
+                for (from, to) in ARG_ALIASES {
+                    if let Some(v) = flat.get(*from).cloned() {
+                        flat.insert((*to).to_string(), v);
+                    }
                 }
-            }
-            Some(flat)
-        });
+                Some(flat)
+            })
+            .or_else(|| {
+                let cmd = non_empty_str(map, "command")?;
+                let mut m = Map::new();
+                m.insert("command".into(), Value::String(cmd.to_string()));
+                Some(m)
+            });
         if let Some(input) = input {
             map.insert("tool_input".into(), Value::Object(input));
         }
@@ -128,6 +146,101 @@ pub fn refine(event: &str, map: &Map<String, Value>) -> String {
         return "StopFailure".into();
     }
     event.to_string()
+}
+
+/// Cursor shell execution tools and file-modification tools.
+const CURSOR_SHELL_TOOLS: &[&str] = &[
+    "Bash",
+    "Shell",
+    "Run",
+    "PowerShell",
+    "run_terminal_cmd",
+    "execute_command",
+    "run_command",
+];
+
+const CURSOR_FILE_EDIT_TOOLS: &[&str] = &[
+    "Write",
+    "Edit",
+    "MultiEdit",
+    "Delete",
+    "write_file",
+    "edit_file",
+    "edit_notebook",
+    "NotebookEdit",
+];
+
+/// True when a `PreToolUse` event from `agent` (Antigravity or Cursor Agent)
+/// should be promoted to `PermissionRequest` so the island shows an Allow/Deny
+/// card and the relay waits for a click.
+pub fn promote_to_permission_request(
+    agent: &str,
+    event: &str,
+    map: &Map<String, Value>,
+    home: Option<&Path>,
+) -> bool {
+    if event != "PreToolUse" {
+        return false;
+    }
+    match agent {
+        "antigravity" => antigravity::needs_approval(map, home),
+        "cursor" => cursor_needs_approval(map),
+        _ => false,
+    }
+}
+
+fn cursor_needs_approval(map: &Map<String, Value>) -> bool {
+    let tool = map.get("tool_name").and_then(Value::as_str).unwrap_or("");
+    let input = map.get("tool_input").and_then(Value::as_object);
+
+    // Any shell execution tool or explicit command in tool_input prompts in the island.
+    if CURSOR_SHELL_TOOLS.iter().any(|t| t.eq_ignore_ascii_case(tool)) {
+        return true;
+    }
+    if input
+        .and_then(|i| i.get("command"))
+        .and_then(Value::as_str)
+        .is_some_and(|c| !c.trim().is_empty())
+    {
+        return true;
+    }
+
+    // Out-of-workspace file edits prompt in the island; workspace file edits pass through.
+    if CURSOR_FILE_EDIT_TOOLS.iter().any(|t| t.eq_ignore_ascii_case(tool)) {
+        let target = input
+            .and_then(|i| {
+                i.get("file_path")
+                    .or_else(|| i.get("path"))
+                    .or_else(|| i.get("target_file"))
+                    .or_else(|| i.get("Path"))
+                    .or_else(|| i.get("FilePath"))
+            })
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if target.is_empty() {
+            return false;
+        }
+        let mut roots: Vec<String> = ["workspace_roots", "workspacePaths"]
+            .iter()
+            .filter_map(|k| map.get(*k).and_then(Value::as_array))
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        if roots.is_empty() {
+            if let Some(cwd) = map.get("cwd").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                roots.push(cwd.to_string());
+            }
+        }
+        if roots.is_empty() {
+            return false;
+        }
+        return !antigravity::is_inside_workspaces(target, &roots);
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -263,5 +376,45 @@ mod tests {
             assert_eq!(refine("Stop", &obj(json!({ "status": status }))), "Stop");
         }
         assert_eq!(refine("PreToolUse", &obj(json!({ "status": "error" }))), "PreToolUse");
+    }
+
+    #[test]
+    fn cursor_shell_and_outside_file_edits_promote_to_permission_request() {
+        let mut shell = obj(json!({
+            "hook_event_name": "preToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": "npm test" },
+            "workspace_roots": ["/w/proj"]
+        }));
+        fields(&mut shell, &no_env);
+        assert!(promote_to_permission_request("cursor", "PreToolUse", &shell, None));
+
+        let mut before_shell = obj(json!({
+            "hook_event_name": "beforeShellExecution",
+            "command": "git push",
+            "workspace_roots": ["/w/proj"]
+        }));
+        fields(&mut before_shell, &no_env);
+        assert_eq!(before_shell["tool_name"], "Bash");
+        assert_eq!(before_shell["tool_input"]["command"], "git push");
+        assert!(promote_to_permission_request("cursor", "PreToolUse", &before_shell, None));
+
+        let mut inside_edit = obj(json!({
+            "hook_event_name": "preToolUse",
+            "tool_name": "Write",
+            "tool_input": { "file_path": "/w/proj/src/index.ts" },
+            "workspace_roots": ["/w/proj"]
+        }));
+        fields(&mut inside_edit, &no_env);
+        assert!(!promote_to_permission_request("cursor", "PreToolUse", &inside_edit, None));
+
+        let mut outside_edit = obj(json!({
+            "hook_event_name": "preToolUse",
+            "tool_name": "Write",
+            "tool_input": { "file_path": "/etc/hosts" },
+            "workspace_roots": ["/w/proj"]
+        }));
+        fields(&mut outside_edit, &no_env);
+        assert!(promote_to_permission_request("cursor", "PreToolUse", &outside_edit, None));
     }
 }

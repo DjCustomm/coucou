@@ -602,17 +602,26 @@ function buildQuestion(actions: ViewActions): ViewHost {
       const questions = State.pendingApproval?.questions;
       clear(who);
       // Only a request that is waiting can be folded away and come back.
-      fold.style.display = State.pendingApproval ? "" : "none";
+      fold.style.display = State.pendingApproval || State.focusTask?.state === "question" ? "" : "none";
 
       // A question that arrived as a notification has nothing to pick from.
       if (!questions) {
         who.append(agentWho(State.focusTask, t("is asking a question")));
         const task = State.focusTask;
-        title.textContent = (task && lastTextStep(task.steps)) ?? t("Claude needs an answer.");
-        if (rowKey !== "terminal") {
-          rowKey = "terminal";
+        title.textContent = task?.finalLine || (task && lastTextStep(task.steps)) || t("Claude needs an answer.");
+        const inApp =
+          task?.id === "agent_antigravity" ||
+          task?.id === "agent_cursor" ||
+          task?.id === "agent_claude-desktop" ||
+          task?.id === "agent_opencode";
+        const key = inApp ? "app" : "terminal";
+        if (rowKey !== key) {
+          rowKey = key;
           clear(row);
-          row.append(h("div", { class: "sub", text: tl("Answer it in your terminal.") }));
+          row.append(
+            btn(tl("Open"), "primary", () => actions.openTerminal()),
+            h("div", { class: "sub", text: inApp ? t("Answer it in the app.") : tl("Answer it in your terminal.") }),
+          );
         }
         return;
       }

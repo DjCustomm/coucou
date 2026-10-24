@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use serde_json::{Map, Value};
 
+mod antigravity;
 mod normalize;
 mod reply;
 
@@ -174,8 +175,7 @@ fn prepare(raw: &[u8], args: &Args, env: &dyn Fn(&str) -> Option<String>, cwd: &
         .map(str::to_string)
         .unwrap_or_else(|| args.event.clone());
     normalize::fields(map, env);
-    let name = normalize::refine(normalize::event(&raw_event), map);
-    map.insert("hook_event_name".into(), Value::String(name.clone()));
+    let mut name = normalize::refine(normalize::event(&raw_event), map);
 
     for field in DROPPED_FIELDS {
         map.remove(*field);
@@ -185,13 +185,27 @@ fn prepare(raw: &[u8], args: &Args, env: &dyn Fn(&str) -> Option<String>, cwd: &
         map.insert("cwd".into(), Value::String(cwd.to_string()));
     }
 
+    // Antigravity and Cursor Agent use PreToolUse / beforeShellExecution as blocking
+    // decision hooks. Promote to PermissionRequest only when the tool call actually
+    // requires approval (e.g. Antigravity not in Turbo mode & command not allowlisted,
+    // or Cursor shell / out-of-workspace file edit).
+    let home = antigravity::home_from_env(env);
+    if normalize::promote_to_permission_request(&args.agent, &name, map, home.as_deref()) {
+        map.insert("coucou_promoted_from".into(), Value::String(name));
+        name = "PermissionRequest".to_string();
+    }
+    map.insert("hook_event_name".into(), Value::String(name.clone()));
+
     add_terminal_context(map, env);
 
-    // Kept whole: what goes back to Claude Code must be its own input, not the
-    // shortened copy the island is shown.
-    let question = (map.get("tool_name").and_then(Value::as_str) == Some("AskUserQuestion"))
-        .then(|| map.get("tool_input").cloned())
-        .flatten();
+    // Kept whole: what goes back to Claude Code (or OpenCode's question tool) must be
+    // its own input, not the shortened copy the island is shown.
+    let question = matches!(
+        map.get("tool_name").and_then(Value::as_str),
+        Some("AskUserQuestion" | "question")
+    )
+    .then(|| map.get("tool_input").cloned())
+    .flatten();
 
     // Every string is capped, except the edit text of a finished Edit /
     // MultiEdit / Write, which the live diff needs whole (within its own limits).
@@ -442,6 +456,14 @@ mod tests {
         let (v, ev) = run(r#"{"hook_event_name":"stop","status":"error","tool_output":"huge"}"#, "cursor", "");
         assert_eq!(ev.name, "StopFailure");
         assert!(v.get("tool_output").is_none());
+
+        // Cursor: a shell execution promoted from PreToolUse to PermissionRequest.
+        let (v, ev) = run(r#"{"hook_event_name":"beforeShellExecution","command":"npm publish"}"#, "cursor", "");
+        assert_eq!(ev.name, "PermissionRequest");
+        assert_eq!(v["hook_event_name"], "PermissionRequest");
+        assert_eq!(v["coucou_promoted_from"], "PreToolUse");
+        assert_eq!(v["tool_name"], "Bash");
+        assert_eq!(v["tool_input"]["command"], "npm publish");
     }
 
     #[test]

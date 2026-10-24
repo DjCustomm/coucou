@@ -466,16 +466,24 @@ pub fn focus_session_window(owners: &[u32], folder: &str) -> bool {
 
 /// Brings forward the window of a running app, by executable name.
 fn focus_app(exe: &str) -> bool {
+    focus_app_window(exe, "")
+}
+
+/// Brings forward the window of a running app by executable name, preferring one titled after `folder`.
+pub fn focus_app_window(exe: &str, folder: &str) -> bool {
     let pids: Vec<u32> = process_table()
         .into_iter()
         .filter(|(_, p)| p.exe.eq_ignore_ascii_case(exe))
         .map(|(pid, _)| pid)
         .collect();
-    top_windows()
+    let candidates: Vec<(isize, String)> = top_windows()
         .into_iter()
-        .find(|(_, owner, _)| pids.contains(owner))
-        .is_some_and(|(hwnd, _, _)| bring_forward(hwnd))
+        .filter(|(_, owner, _)| pids.contains(owner))
+        .map(|(hwnd, _, title)| (hwnd, title))
+        .collect();
+    session_window::pick_window(&candidates, folder).is_some_and(|hwnd| bring_forward(*hwnd))
 }
+
 
 /// The Claude desktop app: brought forward when it runs (Claude Code's own
 /// `claude.exe` has no window of its own, so it is never the one picked),
